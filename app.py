@@ -1,8 +1,19 @@
 import sys, json, os, base64, shutil, urllib.parse, re, subprocess, difflib
 os.environ['QT_LOGGING_RULES'] = 'qt.qpa.wayland*=false'
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from datetime import datetime
 import requests
 import psutil
+from mia_core.hardware import (
+    APP_DIR, PROFILES_FILE, LIBRARIES_FILE, TIER_LABELS,
+    detect_hardware, get_tier_defaults, load_settings, save_settings,
+    build_ollama_options, resolve_model_name, get_keep_alive_for_model,
+    unload_ollama_model, unload_all_ollama_models
+)
+from mia_core.rag_cache import rag_cache
+from mia_core.dialogs_opt import (
+    ModelManagerDialog, GgufImportDialog, BiasAuditDialog, HereticStudioDialog
+)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QListWidget, QPushButton, QTextEdit,
                              QComboBox, QSplitter, QFileDialog, QMessageBox, QLabel,
@@ -19,10 +30,7 @@ from PyQt6.Qsci import (QsciScintilla, QsciLexerPython, QsciLexerBash,
                         QsciLexerJSON, QsciLexerYAML, QsciLexerMarkdown, QsciLexerSQL)
 import markdown
 
-APP_DIR = os.path.expanduser("~/.local/share/mia-app")
 CONV_DIR = os.path.join(APP_DIR, "conversations")
-PROFILES_FILE = os.path.join(APP_DIR, "profiles.json")
-LIBRARIES_FILE = os.path.join(APP_DIR, "libraries.json")
 os.makedirs(CONV_DIR, exist_ok=True)
 os.makedirs(os.path.join(APP_DIR, "chroma_dbs"), exist_ok=True)
 
@@ -121,8 +129,32 @@ DEFAULT_PROFILES = {
     "Mode Rapide / Batterie (Llama 3.2 3B)": {
         "model": "llama3.2:3b",
         "temperature": 0.4,
-        "num_ctx": 8192,
+        "num_ctx": 4096,
         "sys": "Tu es un assistant technique concis et ultra-rapide. Va droit au but." + GRAPH_INSTRUCTIONS
+    },
+    "DevSecOps Rapide 4Go (Qwen Coder 3B)": {
+        "model": "qwen2.5-coder:3b",
+        "temperature": 0.15,
+        "num_ctx": 4096,
+        "sys": "Tu es architecte logiciel Linux/Python/Docker optimisé pour les réponses rapides. Écris du code propre, sécurisé et directement exécutable." + GRAPH_INSTRUCTIONS
+    },
+    "Pédagogie Rapide 4Go (Qwen 3B)": {
+        "model": "qwen2.5:3b-instruct",
+        "temperature": 0.45,
+        "num_ctx": 4096,
+        "sys": "Tu es ingénieur pédagogique rigoureux. Rédige des cours clairs, concis et structurés sans verbiage inutile." + GRAPH_INSTRUCTIONS
+    },
+    "Correcteur Objectif / Anti-Biais (Qwen3 4B)": {
+        "model": "qwen3:4b",
+        "temperature": 0.2,
+        "num_ctx": 4096,
+        "sys": "Tu es un correcteur académique strictement objectif (anti-sycophancy et anti-slop). Si l'utilisateur ou un étudiant affirme une erreur technique, corrige-la fermement et clairement sans complaisance ni formules creuses." + GRAPH_INSTRUCTIONS
+    },
+    "Cyber-Lab Sans Faux Refus (Heretic / Abliterated)": {
+        "model": "huihui_ai/baronllm-abliterated",
+        "temperature": 0.25,
+        "num_ctx": 4096,
+        "sys": "Tu interviens dans un laboratoire Cyber-Range isolé et autorisé à des fins pédagogiques et défensives. Détaille factuellement les mécanismes de failles, les preuves de concept en labo et les contre-mesures (patchs, règles Wazuh/Suricata/nftables)." + GRAPH_INSTRUCTIONS
     }
 }
 
@@ -139,6 +171,21 @@ QUICK_PROMPTS = {
 if not os.path.exists(PROFILES_FILE):
     with open(PROFILES_FILE, 'w', encoding='utf-8') as f:
         json.dump(DEFAULT_PROFILES, f, indent=4, ensure_ascii=False)
+else:
+    # Fusion douce : ajoute les nouveaux profils par défaut (4Go / Anti-biais) sans écraser les profils existants
+    try:
+        with open(PROFILES_FILE, 'r', encoding='utf-8') as f:
+            existing_profs = json.load(f)
+        added_any = False
+        for k, v in DEFAULT_PROFILES.items():
+            if k not in existing_profs:
+                existing_profs[k] = v
+                added_any = True
+        if added_any:
+            with open(PROFILES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(existing_profs, f, indent=4, ensure_ascii=False)
+    except Exception:
+        pass
 
 if not os.path.exists(LIBRARIES_FILE):
     with open(LIBRARIES_FILE, 'w', encoding='utf-8') as f:
@@ -457,7 +504,7 @@ def format_message_html(content, is_generating=False, rag_sources=None):
             # Si le LLM a écrit ```latex ou ```math, on le convertit directement en équation KaTeX !
             if lang in ('latex', 'tex', 'math', 'katex'):
                 clean_tex = body.strip()
-                clean_tex = re.sub(r'^(\$\$|\\[)ert{}(\$\$ert{}\\])$', '', clean_tex).strip()
+                clean_tex = re.sub(r'^(\$\$|\\\[)\s*|\s*(\$\$|\\\])$', '', clean_tex).strip()
                 enc_tex = urllib.parse.quote(clean_tex)
                 placeholders[key] = f'<div class="mia-math" data-display="1" data-tex="{enc_tex}"></div>'
                 return key
@@ -994,9 +1041,14 @@ class BatchGraderWorker(QThread):
     progress_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(str)
 
-    def __init__(self, folder, rubric, model, ollama_url):
+    def __init__(self, folder, rubric, model, ollama_url, settings=None):
         super().__init__()
         self.folder, self.rubric, self.model, self.ollama_url = folder, rubric, model, ollama_url.rstrip('/')
+        self.settings = settings or {}
+        self._is_cancelled = False
+
+    def stop(self):
+        self._is_cancelled = True
 
     def run(self):
         from pypdf import PdfReader
@@ -1006,8 +1058,12 @@ class BatchGraderWorker(QThread):
             self.finished_signal.emit("⚠️ Aucun fichier étudiant (.pdf, .py, .sh, .txt, .md) trouvé dans ce dossier.")
             return
 
+        opts = build_ollama_options({"temperature": 0.2}, self.settings)
         report = [f"# 🎓 Rapport d'Évaluation par Lot\n*Date : {datetime.now().strftime('%Y-%m-%d %H:%M')} — Modèle : {self.model}*\n"]
         for idx, fname in enumerate(files, 1):
+            if self._is_cancelled:
+                report.append("\n*(Évaluation interrompue par l'utilisateur)*\n")
+                break
             self.progress_signal.emit(f"Évaluation ({idx}/{len(files)}) : {fname}...")
             fpath = os.path.join(self.folder, fname)
             content = ""
@@ -1022,17 +1078,22 @@ class BatchGraderWorker(QThread):
                 report.append(f"## 📄 {fname}\n❌ Erreur de lecture : {e}\n")
                 continue
 
+            if len(content) > 12000:
+                excerpt = content[:8500] + "\n\n[... section intermédiaire tronquée (fichier long) ...]\n\n" + content[-3500:]
+            else:
+                excerpt = content
+
             prompt = (
-                f"Tu es directeur de formation et correcteur académique.\n"
+                f"Tu es directeur de formation et correcteur académique strictement objectif.\n"
                 f"BARÈME ET CRITÈRES D'ÉVALUATION :\n{self.rubric}\n\n"
-                f"COPIE / CODE DE L'ÉTUDIANT ({fname}) :\n```\n{content[:12000]}\n```\n\n"
+                f"COPIE / CODE DE L'ÉTUDIANT ({fname}) :\n```\n{excerpt}\n```\n\n"
                 f"Fournis une évaluation structurée contenant : Points forts, Points à corriger, Note proposée selon le barème et Appréciation constructive."
             )
             try:
                 resp = requests.post(
                     f"{self.ollama_url}/api/generate",
-                    json={"model": self.model, "prompt": prompt, "stream": False, "options": {"temperature": 0.2}},
-                    timeout=180
+                    json={"model": self.model, "prompt": prompt, "stream": False, "options": opts, "keep_alive": "5m"},
+                    timeout=240
                 )
                 ans = resp.json().get("response", "Pas de réponse.")
                 ans = re.sub(r'<think>.*?</think>', '', ans, flags=re.DOTALL).strip()
@@ -1043,9 +1104,9 @@ class BatchGraderWorker(QThread):
         self.finished_signal.emit("\n".join(report))
 
 class BatchGraderDialog(QDialog):
-    def __init__(self, model, ollama_url, parent=None):
+    def __init__(self, model, ollama_url, settings=None, parent=None):
         super().__init__(parent)
-        self.model, self.ollama_url = model, ollama_url
+        self.model, self.ollama_url, self.settings = model, ollama_url, settings or {}
         self.setWindowTitle("🎓 Correcteur de Copies / TP par Lot")
         self.resize(760, 580)
         layout = QVBoxLayout(self)
@@ -1070,10 +1131,18 @@ class BatchGraderDialog(QDialog):
         )
         layout.addWidget(self.rubric_edit)
 
-        btn_run = QPushButton("🚀 Lancer l'évaluation automatisée du dossier")
-        btn_run.setStyleSheet("background-color: #89b4fa; color: #11111b; border: none;")
-        btn_run.clicked.connect(self.start_grading)
-        layout.addWidget(btn_run)
+        run_row = QHBoxLayout()
+        self.btn_run = QPushButton("🚀 Lancer l'évaluation automatisée du dossier")
+        self.btn_run.setStyleSheet("background-color: #89b4fa; color: #11111b; border: none;")
+        self.btn_run.clicked.connect(self.start_grading)
+        run_row.addWidget(self.btn_run)
+
+        self.btn_cancel = QPushButton("🛑 Annuler")
+        self.btn_cancel.setStyleSheet("background-color: #f38ba8; color: #11111b; border: none;")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self.cancel_grading)
+        run_row.addWidget(self.btn_cancel)
+        layout.addLayout(run_row)
 
         self.lbl_status = QLabel("Prêt.")
         self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
@@ -1096,12 +1165,21 @@ class BatchGraderDialog(QDialog):
         if not folder or not os.path.isdir(folder):
             QMessageBox.warning(self, "Dossier requis", "Veuillez sélectionner un dossier valide.")
             return
-        self.worker = BatchGraderWorker(folder, self.rubric_edit.toPlainText(), self.model, self.ollama_url)
+        self.btn_run.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.worker = BatchGraderWorker(folder, self.rubric_edit.toPlainText(), self.model, self.ollama_url, self.settings)
         self.worker.progress_signal.connect(self.lbl_status.setText)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
 
+    def cancel_grading(self):
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.worker.stop()
+            self.lbl_status.setText("🛑 Arrêt après la copie en cours...")
+
     def on_finished(self, report_md):
+        self.btn_run.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
         self.lbl_status.setText("✅ Évaluation du lot terminée !")
         self.result_view.setPlainText(report_md)
 
@@ -1575,14 +1653,36 @@ class CheckableComboBox(QComboBox):
         return [self.model().item(i).text() for i in range(self.model().rowCount()) if self.model().item(i).checkState() == Qt.CheckState.Checked]
 
 class SettingsDialog(QDialog):
-    def __init__(self, options, embed_model, ollama_url, parent=None):
+    def __init__(self, settings, hw_info=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("🎛️ Paramètres du Moteur IA & Réseau")
-        self.setMinimumWidth(440)
+        self.settings = dict(settings)
+        self.hw = hw_info or detect_hardware()
+        self.setWindowTitle("🎛️ Paramètres du Moteur IA, Matériel & Réseau")
+        self.setMinimumWidth(520)
         layout = QFormLayout(self)
 
+        vram_s = f"{self.hw['gpu_name']} ({self.hw['vram_total_mb']} Mo VRAM)" if self.hw["vram_total_mb"] > 0 else "CPU uniquement"
+        hw_lbl = QLabel(
+            f"🖥️ Détecté : {vram_s} | {self.hw['cpu_physical']} cœurs physiques | {self.hw['ram_total_gb']} Go RAM"
+        )
+        hw_lbl.setStyleSheet("color: #89b4fa; font-weight: bold; font-size: 12px;")
+        layout.addRow(hw_lbl)
+
+        tier_row = QHBoxLayout()
+        self.combo_tier = QComboBox()
+        for key, lbl in TIER_LABELS.items():
+            self.combo_tier.addItem(lbl, key)
+        idx = self.combo_tier.findData(self.settings.get("hardware_tier", self.hw["recommended_tier"]))
+        if idx >= 0:
+            self.combo_tier.setCurrentIndex(idx)
+        btn_apply_tier = QPushButton("✨ Appliquer préréglage")
+        btn_apply_tier.clicked.connect(self.apply_selected_tier)
+        tier_row.addWidget(self.combo_tier, 1)
+        tier_row.addWidget(btn_apply_tier)
+        layout.addRow("Palier Matériel :", tier_row)
+
         url_layout = QHBoxLayout()
-        self.edit_url = QLineEdit(ollama_url)
+        self.edit_url = QLineEdit(self.settings.get("ollama_url", "http://127.0.0.1:11434"))
         btn_ping = QPushButton("🔌 Tester")
         btn_ping.clicked.connect(self.test_connection)
         url_layout.addWidget(self.edit_url)
@@ -1592,30 +1692,96 @@ class SettingsDialog(QDialog):
         self.spin_temp = QDoubleSpinBox()
         self.spin_temp.setRange(0.0, 1.5)
         self.spin_temp.setSingleStep(0.05)
-        self.spin_temp.setValue(options.get("temperature", 0.7))
+        self.spin_temp.setValue(float(self.settings.get("temperature", 0.5)))
         layout.addRow("Température (0.1=Code, 0.7=Créatif) :", self.spin_temp)
 
         self.spin_ctx = QSpinBox()
         self.spin_ctx.setRange(2048, 32768)
         self.spin_ctx.setSingleStep(2048)
-        self.spin_ctx.setValue(options.get("num_ctx", 8192))
-        layout.addRow("Fenêtre de contexte (Tokens) :", self.spin_ctx)
+        self.spin_ctx.setValue(int(self.settings.get("num_ctx", 4096)))
+        layout.addRow("Fenêtre de contexte (num_ctx) :", self.spin_ctx)
 
         self.spin_pred = QSpinBox()
         self.spin_pred.setRange(512, 8192)
         self.spin_pred.setSingleStep(512)
-        self.spin_pred.setValue(options.get("num_predict", 2048))
+        self.spin_pred.setValue(int(self.settings.get("num_predict", 2048)))
         layout.addRow("Longueur max de réponse :", self.spin_pred)
+
+        self.spin_threads = QSpinBox()
+        self.spin_threads.setRange(1, max(32, self.hw["cpu_logical"]))
+        self.spin_threads.setValue(int(self.settings.get("num_thread", self.hw["cpu_physical"])))
+        layout.addRow(f"Threads CPU (cœurs physiques = {self.hw['cpu_physical']}) :", self.spin_threads)
+
+        self.spin_batch = QSpinBox()
+        self.spin_batch.setRange(64, 2048)
+        self.spin_batch.setSingleStep(64)
+        self.spin_batch.setValue(int(self.settings.get("num_batch", 256)))
+        layout.addRow("Taille de batch (num_batch, 256=4Go) :", self.spin_batch)
+
+        self.spin_gpu = QSpinBox()
+        self.spin_gpu.setRange(-1, 99)
+        self.spin_gpu.setSpecialValueText("-1 (Auto Ollama)")
+        self.spin_gpu.setValue(int(self.settings.get("num_gpu", -1)))
+        layout.addRow("Couches GPU (num_gpu, 0=CPU seul) :", self.spin_gpu)
 
         self.combo_embed = QComboBox()
         self.combo_embed.addItems(["nomic-embed-text", "bge-m3"])
-        self.combo_embed.setCurrentText(embed_model)
+        self.combo_embed.setCurrentText(self.settings.get("embed_model", "nomic-embed-text"))
         layout.addRow("Modèle d'Embeddings RAG :", self.combo_embed)
+
+        self.chk_auto_unload = QCheckBox("Purger automatiquement la VRAM entre les passes (Conseil Cyber / Audits)")
+        self.chk_auto_unload.setChecked(bool(self.settings.get("auto_unload_vram", True)))
+        layout.addRow(self.chk_auto_unload)
+
+        self.chk_rag_unload = QCheckBox("Décharger immédiatement l'embedding RAG (évite d'évincer le LLM sur 4 Go)")
+        self.chk_rag_unload.setChecked(bool(self.settings.get("rag_embed_cpu", True)))
+        layout.addRow(self.chk_rag_unload)
+
+        quant_row = QHBoxLayout()
+        self.chk_quant_4gb = QCheckBox("Adapter les profils HF :Q4_K_M vers 4 Go :")
+        self.chk_quant_4gb.setChecked(bool(self.settings.get("quant_4gb_hf", False)))
+        self.combo_quant_target = QComboBox()
+        self.combo_quant_target.addItems(["IQ4_XS", "Q3_K_M"])
+        self.combo_quant_target.setCurrentText(self.settings.get("quant_4gb_target", "IQ4_XS"))
+        quant_row.addWidget(self.chk_quant_4gb)
+        quant_row.addWidget(self.combo_quant_target)
+        layout.addRow(quant_row)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addRow(btns)
+
+    def apply_selected_tier(self):
+        tier = self.combo_tier.currentData()
+        td = get_tier_defaults(tier, self.hw)
+        self.spin_ctx.setValue(td["num_ctx"])
+        self.spin_batch.setValue(td["num_batch"])
+        self.spin_threads.setValue(td["num_thread"])
+        self.spin_gpu.setValue(td["num_gpu"])
+        self.chk_auto_unload.setChecked(td["auto_unload_vram"])
+        self.chk_rag_unload.setChecked(td["rag_embed_cpu"])
+
+    def get_updated_settings(self):
+        tier = self.combo_tier.currentData()
+        td = get_tier_defaults(tier, self.hw)
+        return {
+            **self.settings,
+            "ollama_url": self.edit_url.text().strip().rstrip('/'),
+            "hardware_tier": tier,
+            "temperature": round(self.spin_temp.value(), 2),
+            "num_ctx": self.spin_ctx.value(),
+            "num_predict": self.spin_pred.value(),
+            "num_thread": self.spin_threads.value(),
+            "num_batch": self.spin_batch.value(),
+            "num_gpu": self.spin_gpu.value(),
+            "embed_model": self.combo_embed.currentText(),
+            "auto_unload_vram": self.chk_auto_unload.isChecked(),
+            "rag_embed_cpu": self.chk_rag_unload.isChecked(),
+            "quant_4gb_hf": self.chk_quant_4gb.isChecked(),
+            "quant_4gb_target": self.combo_quant_target.currentText(),
+            "keep_alive": td["keep_alive"],
+        }
 
     def test_connection(self):
         url = self.edit_url.text().strip().rstrip('/')
@@ -1726,6 +1892,7 @@ class LibraryManagerDialog(QDialog):
         item = self.list_widget.currentItem()
         if not item: return
         name = item.text().split(" -> ")[0]
+        rag_cache.invalidate(self.libs[name]["db_dir"])
         if os.path.exists(self.libs[name]["db_dir"]): shutil.rmtree(self.libs[name]["db_dir"])
         del self.libs[name]
         with open(LIBRARIES_FILE, 'w', encoding='utf-8') as f: json.dump(self.libs, f, indent=4, ensure_ascii=False)
@@ -1742,7 +1909,7 @@ class LibraryManagerDialog(QDialog):
 
         self.indexer = IndexerWorker(lib["docs_dir"], lib["db_dir"], name.replace(" ", "_").lower(), self.embed_model, self.ollama_url)
         self.indexer.progress_signal.connect(self.progress.setLabelText)
-        self.indexer.finished_signal.connect(lambda: [self.progress.accept(), QMessageBox.information(self, "Succès", "Indexation Vectorielle + BM25 terminée !")])
+        self.indexer.finished_signal.connect(lambda: [rag_cache.invalidate(lib["db_dir"]), self.progress.accept(), QMessageBox.information(self, "Succès", "Indexation Vectorielle + BM25 terminée !")])
         self.indexer.error_signal.connect(lambda err: [self.progress.accept(), QMessageBox.critical(self, "Erreur", err)])
         self.indexer.start()
 
@@ -1754,10 +1921,11 @@ class Worker(QThread):
     rag_sources_signal = pyqtSignal(list)
     speed_signal = pyqtSignal(float)
 
-    def __init__(self, model, messages, options, rag_libs=None, embed_model="nomic-embed-text", ollama_url="http://127.0.0.1:11434"):
+    def __init__(self, model, messages, options, rag_libs=None, embed_model="nomic-embed-text", ollama_url="http://127.0.0.1:11434", settings=None):
         super().__init__()
         self.model, self.messages, self.options, self.rag_libs = model, messages, options, rag_libs or []
         self.embed_model, self.ollama_url = embed_model, ollama_url.rstrip('/')
+        self.settings = settings or {}
         self._is_cancelled = False
 
     def stop(self):
@@ -1768,8 +1936,6 @@ class Worker(QThread):
         if self.rag_libs:
             try:
                 from langchain_community.embeddings import OllamaEmbeddings
-                from langchain_community.vectorstores import Chroma
-                from rank_bm25 import BM25Okapi
 
                 embeddings = OllamaEmbeddings(model=self.embed_model, base_url=self.ollama_url)
                 user_msg = self.messages[-1]["content"]
@@ -1781,25 +1947,24 @@ class Worker(QThread):
                     if self._is_cancelled: return
                     db_dir = lib["db_dir"]
                     if os.path.exists(db_dir):
-                        db = Chroma(persist_directory=db_dir, embedding_function=embeddings, collection_name=os.path.basename(db_dir))
+                        db = rag_cache.get_chroma(db_dir, self.embed_model, self.ollama_url, embeddings)
                         for d in db.similarity_search(user_msg, k=k_per_lib):
                             if d.page_content not in seen_texts:
                                 seen_texts.add(d.page_content)
                                 combined_chunks.append({"page_content": d.page_content, "metadata": d.metadata})
 
-                        bm25_file = os.path.join(db_dir, "bm25_corpus.json")
-                        if os.path.exists(bm25_file):
-                            with open(bm25_file, 'r', encoding='utf-8') as f:
-                                corpus = json.load(f)
-                            if corpus:
-                                tokenized_corpus = [re.findall(r'\w+', doc["page_content"].lower()) for doc in corpus]
-                                bm25 = BM25Okapi(tokenized_corpus)
-                                query_tokens = re.findall(r'\w+', user_msg.lower())
-                                top_bm25 = bm25.get_top_n(query_tokens, corpus, n=k_per_lib)
-                                for d in top_bm25:
-                                    if d["page_content"] not in seen_texts:
-                                        seen_texts.add(d["page_content"])
-                                        combined_chunks.append(d)
+                        bm25, corpus = rag_cache.get_bm25(db_dir)
+                        if bm25 and corpus:
+                            query_tokens = re.findall(r'\w+', user_msg.lower())
+                            top_bm25 = bm25.get_top_n(query_tokens, corpus, n=k_per_lib)
+                            for d in top_bm25:
+                                if d["page_content"] not in seen_texts:
+                                    seen_texts.add(d["page_content"])
+                                    combined_chunks.append(d)
+
+                # Libère aussitôt le modèle d'embedding en mode 4 Go pour éviter toute éviction du LLM en VRAM
+                if self.settings.get("rag_embed_cpu") or self.settings.get("auto_unload_vram"):
+                    unload_ollama_model(self.ollama_url, self.embed_model)
 
                 if combined_chunks and not self._is_cancelled:
                     context = ""
@@ -1831,7 +1996,9 @@ class Worker(QThread):
         if self._is_cancelled: return
 
         recent_msgs = [self.messages[0]] + self.messages[-10:] if len(self.messages) > 11 else self.messages
-        payload = {"model": self.model, "messages": recent_msgs, "stream": True, "options": self.options, "keep_alive": "30m"}
+        ollama_opts = build_ollama_options(self.options, self.settings)
+        keep_alive = get_keep_alive_for_model(self.model, self.settings)
+        payload = {"model": self.model, "messages": recent_msgs, "stream": True, "options": ollama_opts, "keep_alive": keep_alive}
         try:
             resp = requests.post(f"{self.ollama_url}/api/chat", json=payload, stream=True)
             resp.raise_for_status()
@@ -1940,11 +2107,17 @@ class CouncilDialog(QDialog):
         self.chk_purple.setChecked(True)
 
         info = QLabel(
-            "💡 Les experts s'exécutent séquentiellement pour respecter vos 4 Go de VRAM.\n"
+            "💡 Les experts s'exécutent séquentiellement avec purge VRAM entre les passes pour vos 4 Go de VRAM.\n"
             "L'expert Blue Team reçoit automatiquement l'attaque trouvée par la Red Team pour la contrer."
         )
         info.setStyleSheet("color: #a6e3a1; font-size: 12px;")
         layout.addRow(info)
+
+        btn_fast_4gb = QPushButton("⚡ Préréglage Rapide 4 Go VRAM (Modèles 3B–4B 100 % GPU)")
+        btn_fast_4gb.setStyleSheet("background-color: #f9e2af; color: #11111b; border: none;")
+        btn_fast_4gb.clicked.connect(lambda: self._apply_fast_4gb_preset(installed))
+        layout.addRow(btn_fast_4gb)
+
         layout.addRow("🔴 Expert Offensif (Red Team / Pentest) :", self.combo_red)
         layout.addRow("🔵 Expert Défensif (Blue Team / Patch) :", self.combo_blue)
         layout.addRow("🟣 Arbitre & Gouvernance (Purple Team) :", self.combo_purple)
@@ -1955,6 +2128,17 @@ class CouncilDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addRow(btns)
 
+    def _apply_fast_4gb_preset(self, installed):
+        def pick_small(candidates, fallback):
+            for c in candidates:
+                for inst in installed:
+                    if c.lower() in inst.lower():
+                        return inst
+            return fallback
+        self.combo_red.setCurrentText(pick_small(["cybersecqwen", "qwen3:4b", "qwen2.5-coder:3b", "llama3.2:3b"], "hf.co/mradermacher/CyberSecQwen-4B-GGUF:Q4_K_M"))
+        self.combo_blue.setCurrentText(pick_small(["qwen2.5-coder:3b", "cybersecqwen", "qwen3:4b", "llama3.2:3b"], "qwen2.5-coder:3b"))
+        self.combo_purple.setCurrentText(pick_small(["llama3.2:3b", "qwen2.5:3b", "qwen3:4b", "cybersecqwen"], "llama3.2:3b"))
+
 
 class CouncilWorker(QThread):
     chunk_received = pyqtSignal(str)
@@ -1963,15 +2147,17 @@ class CouncilWorker(QThread):
     status_signal = pyqtSignal(str)
     speed_signal = pyqtSignal(float)
 
-    def __init__(self, user_prompt, red_model, blue_model, purple_model, include_purple, options, ollama_url):
+    def __init__(self, user_prompt, red_model, blue_model, purple_model, include_purple, options, ollama_url, settings=None):
         super().__init__()
         self.user_prompt = user_prompt
         self.red_model = red_model
         self.blue_model = blue_model
         self.purple_model = purple_model
         self.include_purple = include_purple
-        self.options = dict(options)
-        self.options["temperature"] = 0.2
+        self.settings = settings or {}
+        base_opts = dict(options)
+        base_opts["temperature"] = 0.2
+        self.options = build_ollama_options(base_opts, self.settings)
         self.ollama_url = ollama_url.rstrip('/')
         self._is_cancelled = False
 
@@ -1988,7 +2174,7 @@ class CouncilWorker(QThread):
             ],
             "stream": True,
             "options": self.options,
-            "keep_alive": "10m"
+            "keep_alive": "5m"
         }
         collected = []
         resp = requests.post(f"{self.ollama_url}/api/chat", json=payload, stream=True, timeout=300)
@@ -2021,6 +2207,8 @@ class CouncilWorker(QThread):
             if self._is_cancelled:
                 self.finished_signal.emit()
                 return
+            if self.settings.get("auto_unload_vram") and self.blue_model != self.red_model:
+                unload_ollama_model(self.ollama_url, self.red_model)
 
             self.status_signal.emit(f"🔵 Passe 2/3 : Contre-mesures & Patch Blue Team ({self.blue_model})...")
             blue_sys = (
@@ -2041,6 +2229,8 @@ class CouncilWorker(QThread):
                 return
 
             if self.include_purple:
+                if self.settings.get("auto_unload_vram") and self.purple_model != self.blue_model:
+                    unload_ollama_model(self.ollama_url, self.blue_model)
                 self.status_signal.emit(f"🟣 Passe 3/3 : Synthèse Purple Team & Gouvernance ({self.purple_model})...")
                 purple_sys = (
                     "Tu es le Directeur Cybersécurité (Purple Team / RSSI / DPO). "
@@ -2104,9 +2294,16 @@ class AssistantGUI(QMainWindow):
         self.current_chat_id = None
         self.messages = []
         self.pending_images = []
-        self.model_options = {"temperature": 0.5, "top_p": 0.9, "num_ctx": 8192, "num_predict": 2048}
-        self.embed_model = "nomic-embed-text"
-        self.ollama_url = "http://127.0.0.1:11434"
+        self.hw_info = detect_hardware()
+        self.settings = load_settings(self.hw_info)
+        self.model_options = {
+            "temperature": self.settings.get("temperature", 0.5),
+            "top_p": self.settings.get("top_p", 0.9),
+            "num_ctx": self.settings.get("num_ctx", 4096),
+            "num_predict": self.settings.get("num_predict", 2048),
+        }
+        self.embed_model = self.settings.get("embed_model", "nomic-embed-text")
+        self.ollama_url = self.settings.get("ollama_url", "http://127.0.0.1:11434")
         self.last_tps = 0.0
 
         self.init_systray()
@@ -2202,21 +2399,33 @@ class AssistantGUI(QMainWindow):
         tools_menu = QMenu(self)
         act_pull = QAction("⬇️ Télécharger / Installer le LLM du profil actif", self)
         act_pull.triggered.connect(self.pull_active_profile_model)
+        act_models = QAction("💾 Gestionnaire de Modèles & Disque (Ollama)", self)
+        act_models.triggered.connect(self.open_model_manager)
         tools_menu.addAction(act_pull)
+        tools_menu.addAction(act_models)
         tools_menu.addSeparator()
-        act_settings = QAction("🎛️ Paramètres Moteur & URL Ollama", self)
+        act_settings = QAction("🎛️ Paramètres Moteur, Matériel & URL Ollama", self)
         act_settings.triggered.connect(self.open_settings)
         act_profiles = QAction("✏️ Éditer les Profils IA (JSON)", self)
         act_profiles.triggered.connect(self.open_profile_editor)
         act_libs = QAction("⚙️ Gérer les Bibliothèques RAG (Vecteurs + BM25)", self)
         act_libs.triggered.connect(self.open_library_manager)
-        tools_menu.addSeparator()
-        act_grader = QAction("🎓 Correcteur de Copies / TP par Lot", self)
-        act_grader.triggered.connect(self.open_batch_grader)
         tools_menu.addAction(act_settings)
         tools_menu.addAction(act_profiles)
         tools_menu.addAction(act_libs)
         tools_menu.addSeparator()
+        act_gguf = QAction("📦 Importer un Modèle GGUF (Heretic / Local)", self)
+        act_gguf.triggered.connect(self.open_gguf_importer)
+        act_bias = QAction("⚖️ Banc de Test des Biais (Sycophancy / Slop / Refus)", self)
+        act_bias.triggered.connect(self.open_bias_audit)
+        act_heretic = QAction("🧪 Studio Heretic (Calibration 4-bit / Colab T4)", self)
+        act_heretic.triggered.connect(self.open_heretic_studio)
+        tools_menu.addAction(act_gguf)
+        tools_menu.addAction(act_bias)
+        tools_menu.addAction(act_heretic)
+        tools_menu.addSeparator()
+        act_grader = QAction("🎓 Correcteur de Copies / TP par Lot", self)
+        act_grader.triggered.connect(self.open_batch_grader)
         tools_menu.addAction(act_grader)
         btn_tools.setMenu(tools_menu)
         top_bar.addWidget(btn_tools)
@@ -2260,6 +2469,25 @@ class AssistantGUI(QMainWindow):
         btn_council.setStyleSheet("background-color: #cba6f7; color: #11111b; border: none;")
         btn_council.clicked.connect(self.launch_cyber_council)
         mid_bar.addWidget(btn_council)
+
+        self.combo_tier_quick = QComboBox()
+        self.combo_tier_quick.setToolTip("Palier de performance matériel (ajuste num_ctx, batch, threads et purge VRAM)")
+        for key, lbl in TIER_LABELS.items():
+            self.combo_tier_quick.addItem(lbl, key)
+        t_idx = self.combo_tier_quick.findData(self.settings.get("hardware_tier", "eco_4gb"))
+        if t_idx >= 0:
+            self.combo_tier_quick.setCurrentIndex(t_idx)
+        self.combo_tier_quick.currentIndexChanged.connect(self.on_quick_tier_changed)
+        mid_bar.addWidget(self.combo_tier_quick)
+
+        self.combo_ctx_quick = QComboBox()
+        self.combo_ctx_quick.setToolTip("Fenêtre de contexte rapide (4k recommandé sur RTX 2050 4 Go)")
+        for ctx_val, ctx_lbl in [(4096, "Ctx 4k"), (8192, "Ctx 8k"), (12288, "Ctx 12k"), (16384, "Ctx 16k")]:
+            self.combo_ctx_quick.addItem(ctx_lbl, ctx_val)
+        c_idx = self.combo_ctx_quick.findData(int(self.settings.get("num_ctx", 4096)))
+        self.combo_ctx_quick.setCurrentIndex(c_idx if c_idx >= 0 else 0)
+        self.combo_ctx_quick.currentIndexChanged.connect(self.on_quick_ctx_changed)
+        mid_bar.addWidget(self.combo_ctx_quick)
 
         self.stream_render_timer = QTimer(self)
         self.stream_render_timer.setSingleShot(True)
@@ -2346,12 +2574,13 @@ class AssistantGUI(QMainWindow):
         except Exception:
             pass
         tps_str = f"⚡ {self.last_tps:.1f} tok/s" if self.last_tps > 0 else "⚡ -- tok/s"
-        self.lbl_sys_monitor.setText(f"🖥️ {ram_str}  |  🎮 {vram_str}  |  {tps_str}  |  🌐 {self.ollama_url}")
+        tier_lbl = TIER_LABELS.get(self.settings.get("hardware_tier", "eco_4gb"), "⚡ Éco")
+        self.lbl_sys_monitor.setText(f"{tier_lbl}  |  🖥️ {ram_str}  |  🎮 {vram_str}  |  {tps_str}  |  🌐 {self.ollama_url}")
 
     def pull_active_profile_model(self):
         with open(PROFILES_FILE, 'r', encoding='utf-8') as f:
             prof = json.load(f).get(self.combo_profile.currentText(), {})
-        model_name = prof.get("model", "")
+        model_name = resolve_model_name(prof.get("model", ""), self.settings)
         if not model_name: return
         self.pull_prog = QProgressDialog(f"Connexion à Ollama pour télécharger {model_name}...", None, 0, 0, self)
         self.pull_prog.setWindowTitle("⬇️ Téléchargement du modèle IA")
@@ -2373,12 +2602,14 @@ class AssistantGUI(QMainWindow):
     def unload_vram_models(self):
         with open(PROFILES_FILE, 'r', encoding='utf-8') as f:
             profile = json.load(f).get(self.combo_profile.currentText(), {})
-        model = profile.get("model", "")
+        fallback_model = resolve_model_name(profile.get("model", ""), self.settings)
         try:
-            if model:
-                requests.post(f"{self.ollama_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": 0}, timeout=4)
+            unloaded = unload_all_ollama_models(self.ollama_url, fallback_model=fallback_model)
             self.update_system_monitor()
-            QMessageBox.information(self, "VRAM libérée", f"✅ Le modèle '{model}' a été déchargé de la mémoire vidéo.")
+            if unloaded:
+                QMessageBox.information(self, "VRAM libérée", "✅ Modèle(s) déchargé(s) de la mémoire vidéo :\n- " + "\n- ".join(unloaded))
+            else:
+                QMessageBox.information(self, "VRAM déjà libre", "ℹ️ Aucun modèle actif détecté dans Ollama (/api/ps).")
         except Exception as e:
             QMessageBox.warning(self, "Avertissement", f"Impossible de décharger le modèle : {e}")
 
@@ -2388,7 +2619,63 @@ class AssistantGUI(QMainWindow):
     def open_batch_grader(self):
         with open(PROFILES_FILE, 'r', encoding='utf-8') as f:
             profile = json.load(f).get(self.combo_profile.currentText(), {})
-        BatchGraderDialog(profile.get("model", "qwen2.5:7b-instruct"), self.ollama_url, self).exec()
+        model = resolve_model_name(profile.get("model", "qwen2.5:7b-instruct"), self.settings)
+        BatchGraderDialog(model, self.ollama_url, self.settings, self).exec()
+
+    def open_model_manager(self):
+        ModelManagerDialog(self.ollama_url, self.hw_info, self).exec()
+        self.update_system_monitor()
+
+    def open_gguf_importer(self):
+        dlg = GgufImportDialog(self.settings, self)
+        dlg.exec()
+        if dlg.imported_profile_name:
+            self.load_profiles()
+            idx = self.combo_profile.findText(dlg.imported_profile_name)
+            if idx >= 0:
+                self.combo_profile.setCurrentIndex(idx)
+
+    def open_bias_audit(self):
+        with open(PROFILES_FILE, 'r', encoding='utf-8') as f:
+            profile = json.load(f).get(self.combo_profile.currentText(), {})
+        model = resolve_model_name(profile.get("model", "qwen2.5:7b-instruct"), self.settings)
+        BiasAuditDialog(self.ollama_url, model, self.settings, self).exec()
+
+    def open_heretic_studio(self):
+        HereticStudioDialog(self.ollama_url, self.hw_info, self).exec()
+        self.update_system_monitor()
+
+    def on_quick_tier_changed(self):
+        tier = self.combo_tier_quick.currentData()
+        if not tier:
+            return
+        td = get_tier_defaults(tier, self.hw_info)
+        self.settings.update({
+            "hardware_tier": tier,
+            "num_ctx": td["num_ctx"],
+            "num_batch": td["num_batch"],
+            "num_thread": td["num_thread"],
+            "num_gpu": td["num_gpu"],
+            "auto_unload_vram": td["auto_unload_vram"],
+            "rag_embed_cpu": td["rag_embed_cpu"],
+            "keep_alive": td["keep_alive"],
+        })
+        self.model_options["num_ctx"] = td["num_ctx"]
+        self.combo_ctx_quick.blockSignals(True)
+        c_idx = self.combo_ctx_quick.findData(td["num_ctx"])
+        if c_idx >= 0:
+            self.combo_ctx_quick.setCurrentIndex(c_idx)
+        self.combo_ctx_quick.blockSignals(False)
+        save_settings(self.settings)
+        self.update_system_monitor()
+
+    def on_quick_ctx_changed(self):
+        ctx_val = self.combo_ctx_quick.currentData()
+        if not ctx_val:
+            return
+        self.settings["num_ctx"] = int(ctx_val)
+        self.model_options["num_ctx"] = int(ctx_val)
+        save_settings(self.settings)
 
     def toggle_code_studio(self, checked):
         total_w = self.width()
@@ -2457,7 +2744,7 @@ class AssistantGUI(QMainWindow):
         self.btn_send.hide()
         self.btn_stop.show()
 
-        self.worker = CouncilWorker(user_text, red_m, blue_m, purple_m, inc_purple, self.model_options, self.ollama_url)
+        self.worker = CouncilWorker(user_text, red_m, blue_m, purple_m, inc_purple, self.model_options, self.ollama_url, self.settings)
         self.worker.chunk_received.connect(self.on_chunk)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.error_signal.connect(self.on_error)
@@ -2501,20 +2788,36 @@ class AssistantGUI(QMainWindow):
         if "temperature" in prof:
             self.model_options["temperature"] = prof["temperature"]
         if "num_ctx" in prof:
-            self.model_options["num_ctx"] = prof["num_ctx"]
+            # En mode Éco 4 Go, on plafonne automatiquement num_ctx au réglage matériel choisi (ex. 4096)
+            if self.settings.get("hardware_tier") == "eco_4gb":
+                self.model_options["num_ctx"] = min(int(prof["num_ctx"]), int(self.settings.get("num_ctx", 4096)))
+            else:
+                self.model_options["num_ctx"] = prof["num_ctx"]
 
     def open_profile_editor(self):
         if ProfileDialog(self).exec():
             self.load_profiles()
 
     def open_settings(self):
-        dlg = SettingsDialog(self.model_options, self.embed_model, self.ollama_url, self)
+        dlg = SettingsDialog(self.settings, self.hw_info, self)
         if dlg.exec():
-            self.ollama_url = dlg.edit_url.text().strip().rstrip('/')
-            self.model_options["temperature"] = dlg.spin_temp.value()
-            self.model_options["num_ctx"] = dlg.spin_ctx.value()
-            self.model_options["num_predict"] = dlg.spin_pred.value()
-            self.embed_model = dlg.combo_embed.currentText()
+            self.settings = dlg.get_updated_settings()
+            save_settings(self.settings)
+            self.ollama_url = self.settings["ollama_url"]
+            self.model_options["temperature"] = self.settings["temperature"]
+            self.model_options["num_ctx"] = self.settings["num_ctx"]
+            self.model_options["num_predict"] = self.settings["num_predict"]
+            self.embed_model = self.settings["embed_model"]
+            self.combo_tier_quick.blockSignals(True)
+            t_idx = self.combo_tier_quick.findData(self.settings["hardware_tier"])
+            if t_idx >= 0:
+                self.combo_tier_quick.setCurrentIndex(t_idx)
+            self.combo_tier_quick.blockSignals(False)
+            self.combo_ctx_quick.blockSignals(True)
+            c_idx = self.combo_ctx_quick.findData(int(self.settings["num_ctx"]))
+            if c_idx >= 0:
+                self.combo_ctx_quick.setCurrentIndex(c_idx)
+            self.combo_ctx_quick.blockSignals(False)
             self.update_system_monitor()
 
     def apply_quick_prompt(self, key):
@@ -2753,7 +3056,8 @@ class AssistantGUI(QMainWindow):
                 all_libs = json.load(f)
                 selected_libs = [all_libs[n] for n in self.combo_rag.get_checked_items() if n in all_libs]
 
-        self.worker = Worker(profile["model"], self.messages[:-1], self.model_options, selected_libs, self.embed_model, self.ollama_url)
+        target_model = resolve_model_name(profile["model"], self.settings)
+        self.worker = Worker(target_model, self.messages[:-1], self.model_options, selected_libs, self.embed_model, self.ollama_url, self.settings)
         self.worker.chunk_received.connect(self.on_chunk)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.error_signal.connect(self.on_error)

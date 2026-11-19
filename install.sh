@@ -19,6 +19,14 @@ mkdir -p "$HOME/.local/share/applications"
 
 cp "$SCRIPT_DIR/app.py" "$APP_DIR/app.py"
 cp "$SCRIPT_DIR/requirements.txt" "$APP_DIR/requirements.txt"
+if [ -d "$SCRIPT_DIR/mia_core" ]; then
+    rm -rf "$APP_DIR/mia_core"
+    cp -r "$SCRIPT_DIR/mia_core" "$APP_DIR/mia_core"
+fi
+if [ -f "$SCRIPT_DIR/optimize_ollama.sh" ]; then
+    cp "$SCRIPT_DIR/optimize_ollama.sh" "$APP_DIR/optimize_ollama.sh"
+    chmod +x "$APP_DIR/optimize_ollama.sh"
+fi
 
 if [ ! -d "$APP_DIR/venv" ]; then
     echo "🐍 Création de l'environnement virtuel Python..."
@@ -52,7 +60,7 @@ Version=1.0
 Type=Application
 Name=MIA Assistant & IDE
 Comment=Assistant IA Local, RAG Hybride, Pédagogie et Atelier Code QScintilla
-Exec=$APP_DIR/venv/bin/python $APP_DIR/app.py
+Exec=env __NV_PRIME_RENDER_OFFLOAD=0 DRI_PRIME=0 $APP_DIR/venv/bin/python $APP_DIR/app.py
 Icon=utilities-terminal
 Terminal=false
 Categories=Development;Education;Office;
@@ -76,4 +84,8 @@ if ! command -v ollama >/dev/null 2>&1; then
     echo "👉 Puis télécharge un modèle : ollama pull qwen2.5-coder:7b && ollama pull nomic-embed-text"
 else
     echo "👉 Lance MIA depuis ton menu d'applications ou via : $APP_DIR/venv/bin/python $APP_DIR/app.py"
+    if [ ! -f "/etc/systemd/system/ollama.service.d/mia-opt.conf" ]; then
+        echo "⚡ Conseil GPU 4 Go VRAM (RTX 2050) : active Flash Attention + KV-Cache q8_0 avec :"
+        echo "   sudo $SCRIPT_DIR/optimize_ollama.sh q8_0"
+    fi
 fi
