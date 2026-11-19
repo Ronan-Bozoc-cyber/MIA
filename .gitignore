@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+venv/
+conversations/
+chroma_dbs/
+libraries.json
+profiles.json
+*.bak
+katex/
+mermaid/
+chartjs/

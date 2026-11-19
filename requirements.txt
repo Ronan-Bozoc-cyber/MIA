@@ -1,0 +1,13 @@
+PyQt6
+PyQt6-WebEngine
+PyQt6-QScintilla
+markdown
+requests
+chromadb
+langchain
+langchain-community
+langchain-text-splitters
+langchain-core
+pypdf
+rank-bm25
+psutil
